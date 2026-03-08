@@ -1,0 +1,164 @@
+name: Reddit Lead Scanner
+
+# Runs daily at 9AM EST (14:00 UTC) + manual trigger
+on:
+  schedule:
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+
+jobs:
+  scan-reddit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Scan Reddit and send Telegram report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 << 'SCRIPT'
+          import requests
+          import json
+          import os
+          import time
+          import re
+          from datetime import datetime, timedelta
+
+          # --- Configuration ---
+          SUBREDDITS = [
+              "smallbusiness",
+              "Entrepreneur",
+              "forhire",
+              "webdev",
+              "freelance",
+              "startups"
+          ]
+
+          KEYWORDS = [
+              "need a website", "need website", "need a site", "need a web",
+              "looking for a developer", "looking for a web developer",
+              "looking for web developer", "hire a developer", "hire web developer",
+              "hire a web developer", "website built", "build a website",
+              "build me a website", "build my website", "website redesign",
+              "need an app", "need a web app", "web developer needed",
+              "website developer", "frontend developer", "backend developer",
+              "full stack developer", "freelance developer", "shopify developer",
+              "wordpress developer", "ecommerce website", "landing page",
+              "web design", "website help", "who can build", "anyone know a developer",
+              "recommend a developer", "looking for someone to build"
+          ]
+
+          SEEN_FILE = "seen_posts.json"
+          BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          HEADERS = {"User-Agent": "LeadScanner/1.0"}
+          SEVEN_DAYS_AGO = time.time() - (7 * 86400)
+
+          # --- Load previously seen posts ---
+          seen_posts = set()
+          if os.path.exists(SEEN_FILE):
+              with open(SEEN_FILE, "r") as f:
+                  seen_posts = set(json.load(f))
+
+          # --- Scan subreddits ---
+          leads = []
+          for sub in SUBREDDITS:
+              url = f"https://www.reddit.com/r/{sub}/new.json?limit=100"
+              try:
+                  resp = requests.get(url, headers=HEADERS, timeout=15)
+                  if resp.status_code != 200:
+                      print(f"Warning: r/{sub} returned status {resp.status_code}")
+                      continue
+                  data = resp.json()
+                  posts = data.get("data", {}).get("children", [])
+                  for post in posts:
+                      p = post["data"]
+                      post_id = p["id"]
+                      created = p.get("created_utc", 0)
+
+                      # Skip old or already-seen posts
+                      if created < SEVEN_DAYS_AGO or post_id in seen_posts:
+                          continue
+
+                      title = p.get("title", "").lower()
+                      selftext = p.get("selftext", "").lower()
+                      combined = title + " " + selftext
+
+                      # Check for keyword matches
+                      matched_keywords = [kw for kw in KEYWORDS if kw in combined]
+                      if matched_keywords:
+                          leads.append({
+                              "subreddit": sub,
+                              "title": p.get("title", "No title"),
+                              "url": f"https://www.reddit.com{p.get('permalink', '')}",
+                              "author": p.get("author", "unknown"),
+                              "keywords": matched_keywords[:3],
+                              "id": post_id
+                          })
+                          seen_posts.add(post_id)
+              except Exception as e:
+                  print(f"Error scanning r/{sub}: {e}")
+              # Polite delay between requests
+              time.sleep(2)
+
+          # --- Build Telegram message ---
+          today = datetime.utcnow().strftime("%B %d, %Y")
+          if leads:
+              msg = f"🔍 *Reddit Lead Report — {today}*\n"
+              msg += f"Found *{len(leads)}* new lead(s):\n\n"
+              for i, lead in enumerate(leads, 1):
+                  msg += f"{i}. *r/{lead['subreddit']}*\n"
+                  msg += f"   📝 {lead['title']}\n"
+                  msg += f"   👤 u/{lead['author']}\n"
+                  msg += f"   🏷️ Matched: {', '.join(lead['keywords'])}\n"
+                  msg += f"   🔗 {lead['url']}\n\n"
+          else:
+              msg = f"🔍 *Reddit Lead Report — {today}*\n\nNo new leads found today. Will check again tomorrow! ✌️"
+
+          # --- Send to Telegram ---
+          # Split long messages (Telegram limit is 4096 chars)
+          def send_message(text):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+              resp = requests.post(url, json=payload, timeout=15)
+              if resp.status_code != 200:
+                  print(f"Telegram error: {resp.status_code} — {resp.text}")
+                  raise Exception(f"Failed to send Telegram message: {resp.text}")
+              print("Message sent successfully!")
+
+          # Send in chunks if message is too long
+          if len(msg) > 4000:
+              chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+              for chunk in chunks:
+                  send_message(chunk)
+                  time.sleep(1)
+          else:
+              send_message(msg)
+
+          # --- Save seen posts ---
+          with open(SEEN_FILE, "w") as f:
+              # Keep only last 5000 IDs to prevent file from growing forever
+              recent = list(seen_posts)[-5000:]
+              json.dump(recent, f)
+
+          print(f"Done! Found {len(leads)} leads across {len(SUBREDDITS)} subreddits.")
+          SCRIPT
+
+      # Commit the seen_posts file so we don't re-report leads
+      - name: Save seen posts tracker
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_posts.json || true
+          git diff --staged --quiet || git commit -m "Update seen posts tracker [skip ci]"
+          git push || echo "Nothing to push"
